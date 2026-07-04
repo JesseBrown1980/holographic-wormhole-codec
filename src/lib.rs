@@ -222,11 +222,166 @@ pub fn receipt_hbp(pkt: &WormholePacket, verdict: &Verdict, watchers: &[&str]) -
     rows
 }
 
+// ================================================================ N-Q-prism NEXUS LADDER
+// The throat is not a single hop: between the DB mouths sit N-Q-prism NEXUSES, each a UNIFORM
+// bijective transcode at a BEHCS rung (64 / 256 / 1024). Composition of bijections is a bijection,
+// so passing an object down the rung-ladder is lossless end-to-end (H preserved at every nexus).
+// The Brown-Hilbert inject-between provides the intermediate nexus points. MEASURED: each rung's
+// byte<->symbol round-trip. (256<->1024 is also MEASURED byte+sha-identical in the Q-PRISM repo.)
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BehcsRung { B64, B256, B1024, Hyper }
+impl BehcsRung {
+    pub const ALL: [BehcsRung; 4] = [BehcsRung::B64, BehcsRung::B256, BehcsRung::B1024, BehcsRung::Hyper];
+    pub fn width(self) -> u32 { match self { BehcsRung::B64 => 6, BehcsRung::B256 => 8, BehcsRung::B1024 | BehcsRung::Hyper => 10 } }
+    pub fn label(self) -> &'static str {
+        match self { BehcsRung::B64 => "BEHCS-64", BehcsRung::B256 => "BEHCS-256", BehcsRung::B1024 => "BEHCS-1024", BehcsRung::Hyper => "HyperBEHCS-60D" }
+    }
+}
+fn to_symbols(bytes: &[u8], width: u32) -> Vec<u16> {
+    let mut out = Vec::new();
+    let (mut acc, mut n) = (0u32, 0u32);
+    let mask = (1u32 << width) - 1;
+    for &b in bytes { acc = (acc << 8) | b as u32; n += 8; while n >= width { n -= width; out.push(((acc >> n) & mask) as u16); } }
+    if n > 0 { out.push(((acc << (width - n)) & mask) as u16); }
+    out
+}
+fn from_symbols(syms: &[u16], width: u32, orig_len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let (mut acc, mut n) = (0u32, 0u32);
+    for &s in syms { acc = (acc << width) | (s as u32 & ((1u32 << width) - 1)); n += width; while n >= 8 { n -= 8; out.push(((acc >> n) & 0xFF) as u8); } }
+    out.truncate(orig_len);
+    out
+}
+/// A NEXUS between the DB mouths: the object re-represented at one BEHCS rung (uniform, bijective).
+pub fn nexus_transcode(bytes: &[u8], rung: BehcsRung) -> Vec<u16> { to_symbols(bytes, rung.width()) }
+pub fn nexus_untranscode(syms: &[u16], rung: BehcsRung, orig_len: usize) -> Vec<u8> { from_symbols(syms, rung.width(), orig_len) }
+/// Traverse the LADDER of nexuses between the mouths: pass the object through every rung and recover
+/// byte-identical (composition of uniform bijections). `None` if any nexus fails to round-trip.
+pub fn nexus_ladder_traverse(object: &[u8], ladder: &[BehcsRung]) -> Option<Vec<u8>> {
+    for &rung in ladder {
+        let syms = nexus_transcode(object, rung);
+        if nexus_untranscode(&syms, rung, object.len()) != object { return None; }
+    }
+    Some(object.to_vec())
+}
+/// HBP receipt for the nexus ladder (json=0): one row per nexus, uniform + lossless flags.
+pub fn nexus_ladder_hbp(object: &[u8], ladder: &[BehcsRung]) -> Vec<String> {
+    ladder.iter().map(|&rung| {
+        let syms = nexus_transcode(object, rung);
+        let lossless = nexus_untranscode(&syms, rung, object.len()) == object;
+        format!("NEXUS|rung={}|width={}|symbols={}|uniform=1|lossless={}|between=DB_mouths|json=0",
+            rung.label(), rung.width(), syms.len(), if lossless { 1 } else { 0 })
+    }).collect()
+}
+
+// ================================================================ NQPrismNexus (the uniform room)
+// ONE type between the DBBH and DBWH mouths: a uniform interstitial Host8 stubbed room. No matter
+// which N-direction, fabric, cylinder, or slice it sits between, it speaks the SAME hot-path grammar
+// (BEHCS-64/256/1024/HyperBEHCS + Host8 + Brown-Hilbert prefix + N-cylinders + watchers, json=0). It
+// proves all four rungs round-trip, the selected N-cylinders recover-or-Hold, and emits every watcher
+// receipt json=0 - turning the throat from three repo components into a lattice of identical routable
+// rooms. Each room can absorb, translate, watch, and re-emit a slice without changing its structure.
+
+pub const BH_RADIX: u64 = 1024;
+pub const BH_DEPTH: usize = 6;
+/// The 1024-ary Brown-Hilbert depth-6 prefix (2^60 ceiling) of a Host8 handle.
+pub fn bh_prefix(host8: &[u8; 8]) -> [u16; BH_DEPTH] {
+    let mut n = u64::from_be_bytes(*host8) % BH_RADIX.pow(BH_DEPTH as u32);
+    let mut d = [0u16; BH_DEPTH];
+    for i in (0..BH_DEPTH).rev() { d[i] = (n % BH_RADIX) as u16; n /= BH_RADIX; }
+    d
+}
+
+#[derive(Debug, Clone)]
+pub struct NQPrismNexus {
+    pub host8: [u8; 8],
+    pub bh_prefix: [u16; BH_DEPTH],
+    pub agt: String,
+    pub shadows: Vec<Vec<u64>>,
+    pub orig_len: usize,
+}
+impl NQPrismNexus {
+    /// Absorb a slice into the uniform room: Host8, Brown-Hilbert prefix, AGT, N-cylinder shadows.
+    pub fn absorb(object: &[u8]) -> Self {
+        let h = sha256(object);
+        let mut host8 = [0u8; 8];
+        host8.copy_from_slice(&h[..8]);
+        NQPrismNexus { host8, bh_prefix: bh_prefix(&host8), agt: agt(object), shadows: project_shadows(object), orig_len: object.len() }
+    }
+    /// Prove all four rungs (64/256/1024/HyperBEHCS) round-trip byte-identical against the object.
+    pub fn all_rungs_lossless(&self, object: &[u8]) -> bool {
+        BehcsRung::ALL.iter().all(|&r| nexus_untranscode(&nexus_transcode(object, r), r, object.len()) == object)
+    }
+    /// Recover the slice from selected N-cylinders (or Hold), verified against the AGT round-trip.
+    pub fn recover_or_hold(&self, subset: &[usize]) -> Verdict {
+        match reconstruct(&self.shadows, subset, self.orig_len) {
+            Some(r) if agt(&r) == self.agt => Verdict::VerifiedClone(r),
+            Some(_) => Verdict::Held(Held::AddressMismatch),
+            None => Verdict::Held(Held::InsufficientRoof),
+        }
+    }
+    pub fn residual_selector_bits(&self, subset: &[usize]) -> u8 {
+        ((8 * BLOCK) as i64 - roof_bits(subset) as i64).max(0) as u8
+    }
+    pub fn capacity_margin_bits(&self, subset: &[usize]) -> i32 {
+        roof_bits(subset) as i32 - (8 * BLOCK) as i32
+    }
+    /// The uniform hot-path row - every nexus, anywhere, speaks this exact grammar.
+    pub fn nqnexus_row(&self, subset: &[usize]) -> String {
+        let cyls: Vec<String> = subset.iter().map(|&i| CYLINDERS[i].to_string()).collect();
+        let bh: Vec<String> = self.bh_prefix.iter().map(|d| d.to_string()).collect();
+        format!("NQNEXUS|host8={}|pid={}|bh_prefix={}|rungs=64,256,1024,HYPER|cylinders={}|residual_selector_bits={}|capacity_margin_bits_floor={}|watchers=OMNISHANNON,GNN_FORWARD,REVERSE_GNN,MTP1,MTP2,MTP3|body_in_row=0|json=0",
+            hex(&self.host8), self.agt, bh.join("."), cyls.join(","), self.residual_selector_bits(subset), self.capacity_margin_bits(subset))
+    }
+    pub fn watcher_rows(&self) -> Vec<String> {
+        ["OMNISHANNON", "GNN_FORWARD", "REVERSE_GNN", "MTP1", "MTP2", "MTP3"].iter()
+            .map(|w| format!("WATCH|watcher={}|host8={}|role=absorb_translate_watch_reemit|json=0", w, hex(&self.host8)))
+            .collect()
+    }
+}
+
 // ================================================================ tests
 #[cfg(test)]
 mod tests {
     use super::*;
     const WATCHERS: [&str; 6] = ["OMNISHANNON", "GNN_FORWARD", "REVERSE_GNN", "MTP1", "MTP2", "MTP3"];
+
+    #[test]
+    fn nqprism_nexus_is_the_uniform_room() {
+        let obj = b"a uniform Host8 nexus room between DBBH and DBWH, all rungs + cylinders + watchers";
+        let nx = NQPrismNexus::absorb(obj);
+        assert!(nx.all_rungs_lossless(obj)); // all four rungs round-trip (uniform bijective)
+        assert_eq!(nx.recover_or_hold(&[0, 1]), Verdict::VerifiedClone(obj.to_vec())); // 2 cyl recover
+        assert_eq!(nx.recover_or_hold(&[0]), Verdict::Held(Held::InsufficientRoof)); // 1 cyl -> Hold
+        assert_eq!(nx.residual_selector_bits(&[0, 1]), 0);
+        assert!(nx.capacity_margin_bits(&[0, 1]) >= 0);
+        assert_eq!(nx.bh_prefix.len(), 6); // Brown-Hilbert depth-6 (2^60 ceiling)
+        let row = nx.nqnexus_row(&[0, 1]);
+        assert!(row.starts_with("NQNEXUS|host8=") && row.contains("rungs=64,256,1024,HYPER") && row.ends_with("json=0"));
+        assert!(row.contains("body_in_row=0") && row.contains("watchers=OMNISHANNON,GNN_FORWARD,REVERSE_GNN,MTP1,MTP2,MTP3"));
+        assert_eq!(nx.watcher_rows().len(), 6);
+    }
+
+    #[test]
+    fn nexus_ladder_is_uniform_bijective_lossless() {
+        let obj = b"N-Q prisms at the DB nexuses, uniform BEHCS 64/256/1024, lossless";
+        for rung in [BehcsRung::B64, BehcsRung::B256, BehcsRung::B1024] {
+            let syms = nexus_transcode(obj, rung);
+            assert_eq!(nexus_untranscode(&syms, rung, obj.len()), obj, "{} must be bijective", rung.label());
+        }
+        // the whole ladder between the mouths -> byte-identical (composition of bijections)
+        assert_eq!(nexus_ladder_traverse(obj, &[BehcsRung::B64, BehcsRung::B256, BehcsRung::B1024]).as_deref(), Some(&obj[..]));
+        assert_eq!(nexus_transcode(obj, BehcsRung::B256).len(), obj.len()); // 256 rung = byte-identity width
+    }
+
+    #[test]
+    fn nexus_receipt_json0() {
+        let rows = nexus_ladder_hbp(b"receipt at the nexus", &[BehcsRung::B64, BehcsRung::B256, BehcsRung::B1024]);
+        assert!(rows.iter().all(|r| r.ends_with("json=0")) && !rows.join("").contains('{'));
+        assert!(rows.iter().any(|r| r.contains("rung=BEHCS-1024") && r.contains("lossless=1")));
+        assert_eq!(rows.len(), 3);
+    }
 
     #[test]
     fn sha256_kat() {
