@@ -90,7 +90,11 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     o
 }
 fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{:02x}", x)).collect()
+    let mut out = String::with_capacity(b.len() * 2);
+    for x in b {
+        out.push_str(&format!("{:02x}", x));
+    }
+    out
 }
 pub fn agt(data: &[u8]) -> String {
     format!("AGT-{}", &hex(&sha256(data))[..16])
